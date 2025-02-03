@@ -1,8 +1,12 @@
-use core::panic;
-use std::{path::PathBuf, str::FromStr};
+use core::{hash, panic};
+use std::{collections::HashMap, num::NonZero, path::PathBuf, str::FromStr};
 
 use litesvm::LiteSVM;
-use openbook_dex::state::MarketState;
+use openbook_dex::{
+    matching::Side,
+    state::{MarketState, OpenOrders},
+};
+use rand::{rngs::ThreadRng, Rng};
 use solana_sdk::{
     clock::Clock, instruction::Instruction, native_token::LAMPORTS_PER_SOL, program_pack::Pack,
     pubkey::Pubkey, rent::Rent, signature::Keypair, signer::Signer, transaction::Transaction,
@@ -75,6 +79,26 @@ pub fn create_mint(ctx: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pu
         spl_token::instruction::initialize_mint(&spl_token::ID, &mint, authority, None, 6).unwrap();
     send_tx_fail_err(ctx, &[ix], &[payer]);
     mint
+}
+
+fn mint_tokens(
+    ctx: &mut LiteSVM,
+    authority: &Keypair,
+    mint: &Pubkey,
+    account: &Pubkey,
+    amount: u64,
+) {
+    log::debug!("minting tokens");
+    let ix = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        mint,
+        account,
+        &authority.pubkey(),
+        &[&authority.pubkey()],
+        amount,
+    )
+    .unwrap();
+    send_tx_fail_err(ctx, &[ix], &[authority]);
 }
 
 pub fn create_token_account(
@@ -207,8 +231,118 @@ pub fn create_market(
     }
 }
 
-pub fn create_users() {
-    log::info!("create_users");
+fn create_market_order(
+    ctx: &mut LiteSVM,
+    openbook_id: &Pubkey,
+    payer: &Keypair,
+    market: &Market,
+    user: &mut User,
+    side: Side,
+    price: u64,
+    size: u64,
+) {
+    log::debug!("creating market order");
+    let open_orders = user.open_orders.get(&market.market).unwrap();
+    let ix = openbook_dex::instruction::new_order(
+        &market.market,
+        open_orders,
+        &market.req_q,
+        &market.event_q,
+        &market.bids,
+        &market.asks,
+        &user.kp.pubkey(),
+        &user.kp.pubkey(),
+        &market.coin_vault,
+        &market.pc_vault,
+        &spl_token::ID,
+        &solana_sdk::sysvar::rent::ID,
+        None,
+        openbook_id,
+        side,
+        NonZero::new(price).unwrap(),
+        NonZero::new(size).unwrap(),
+        openbook_dex::matching::OrderType::Limit,
+        user.client_order_id,
+        openbook_dex::instruction::SelfTradeBehavior::DecrementTake,
+        u16::MAX,
+        NonZero::new(u64::MAX).unwrap(),
+        i64::MAX,
+    )
+    .unwrap();
+    send_tx_fail_err(ctx, &[ix], &[payer, &user.kp]);
+}
+
+pub struct User {
+    pub kp: Keypair,
+    pub coin_account: Pubkey,
+    pub pc_account: Pubkey,
+    pub open_orders: HashMap<Pubkey, Pubkey>,
+    pub client_order_id: u64,
+}
+
+pub fn create_user(
+    ctx: &mut LiteSVM,
+    markets: &Vec<&Market>,
+    openbook_id: &Pubkey,
+    authority: &Keypair,
+    mint_coin: &Pubkey,
+    mint_pc: &Pubkey,
+) -> User {
+    log::debug!("creating user");
+    let kp = Keypair::new();
+    ctx.airdrop(&kp.pubkey(), LAMPORTS_PER_SOL * 1000).unwrap();
+    let coin_account = create_token_account(ctx, authority, mint_coin, &kp.pubkey());
+    let pc_account = create_token_account(ctx, authority, mint_pc, &kp.pubkey());
+    mint_tokens(
+        ctx,
+        authority,
+        mint_coin,
+        &coin_account,
+        1_000_000 * 1_000_000,
+    );
+    mint_tokens(ctx, authority, mint_pc, &pc_account, 1_000_000 * 1_000_000);
+
+    let mut hash_map = HashMap::new();
+    for market in markets {
+        let open_orders = create_program_account(
+            ctx,
+            authority,
+            size_of::<openbook_dex::state::OpenOrders>() + 12,
+            openbook_id,
+        );
+        let oo_ix = openbook_dex::instruction::init_open_orders(
+            openbook_id,
+            &open_orders,
+            &kp.pubkey(),
+            &market.market,
+            None,
+        )
+        .unwrap();
+        hash_map.insert(market.market, open_orders);
+        send_tx_fail_err(ctx, &[oo_ix], &[&kp]);
+    }
+    User {
+        kp,
+        coin_account,
+        pc_account,
+        open_orders: hash_map,
+        client_order_id: 0,
+    }
+}
+
+pub fn create_users(
+    ctx: &mut LiteSVM,
+    markets: &Vec<&Market>,
+    openbook_id: &Pubkey,
+    authority: &Keypair,
+    mint_coin: &Pubkey,
+    mint_pc: &Pubkey,
+    nb_users: usize,
+) -> Vec<User> {
+    log::debug!("creating {nb_users} users");
+    (0..nb_users)
+        .map(|_| create_user(ctx, markets, openbook_id, authority, mint_coin, mint_pc))
+        .collect()
 }
 
 fn setup_test_chain(openbook_id: Pubkey) -> anyhow::Result<LiteSVM> {
@@ -233,8 +367,6 @@ fn main() {
 
     let mut litesvm = setup_test_chain(openbook_id).unwrap();
 
-    litesvm.warp_to_slot(1);
-
     let payer = Keypair::new();
     litesvm
         .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL * 1000)
@@ -242,8 +374,28 @@ fn main() {
     let coin_mint = create_mint(&mut litesvm, &payer, &payer.pubkey());
     let pc_mint = create_mint(&mut litesvm, &payer, &payer.pubkey());
 
-    litesvm.warp_to_slot(5);
+    litesvm.warp_to_slot(1);
     let market = create_market(&mut litesvm, &payer, &openbook_id, &coin_mint, &pc_mint);
-
+    litesvm.warp_to_slot(2);
     println!("market sucessfully created: {:?}", market);
+
+    let mut users = create_users(
+        &mut litesvm,
+        &vec![&market],
+        &openbook_id,
+        &payer,
+        &coin_mint,
+        &pc_mint,
+        100,
+    );
+    litesvm.warp_to_slot(3);
+    println!("users sucessfully created: {:?}", users.len());
+
+    let price = 1_000_000;
+    let mut rng = ThreadRng::default();
+    loop {
+        let amount = rng.random_range(1000..10000);
+        let price_diff = rng.random_range(-1000..1000);
+        let new_price = price + price_diff;
+    }
 }
