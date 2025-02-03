@@ -1,7 +1,7 @@
 use core::{hash, panic};
 use std::{collections::HashMap, num::NonZero, path::PathBuf, str::FromStr};
 
-use litesvm::LiteSVM;
+use litesvm::{types::TransactionResult, LiteSVM};
 use openbook_dex::{
     matching::Side,
     state::{MarketState, OpenOrders},
@@ -48,6 +48,16 @@ fn send_tx_fail_err(ctx: &mut LiteSVM, ixs: &[Instruction], signers: &[&Keypair]
         );
         panic!("Failed to send transaction");
     }
+}
+
+fn send_transaction_return_result(
+    ctx: &mut LiteSVM,
+    ixs: &[Instruction],
+    signers: &[&Keypair],
+) -> TransactionResult {
+    let mut transaction = Transaction::new_with_payer(ixs, Some(&signers[0].pubkey()));
+    transaction.sign(signers, ctx.latest_blockhash());
+    ctx.send_transaction(transaction)
 }
 
 pub fn create_program_account(
@@ -212,7 +222,7 @@ pub fn create_market(
         &asks_pk,
         &req_q_pk,
         &event_q_pk,
-        100_000,
+        100,
         100,
         vault_signer_nonce,
         500,
@@ -231,18 +241,32 @@ pub fn create_market(
     }
 }
 
-fn create_market_order(
+fn send_market_order(
     ctx: &mut LiteSVM,
     openbook_id: &Pubkey,
-    payer: &Keypair,
     market: &Market,
     user: &mut User,
     side: Side,
     price: u64,
     size: u64,
-) {
+) -> TransactionResult {
     log::debug!("creating market order");
     let open_orders = user.open_orders.get(&market.market).unwrap();
+
+    log::debug!("market: {:?}", ctx.get_account(&market.market));
+    log::debug!("open_orders: {:?}", ctx.get_account(&open_orders));
+    log::debug!("req_q: {:?}", ctx.get_account(&market.req_q));
+    log::debug!("event_q: {:?}", ctx.get_account(&market.event_q));
+    log::debug!("bids: {:?}", ctx.get_account(&market.bids));
+    log::debug!("asks: {:?}", ctx.get_account(&market.asks));
+    log::debug!("coin_vault: {:?}", ctx.get_account(&market.coin_vault));
+    log::debug!("pc_vault: {:?}", ctx.get_account(&market.pc_vault));
+
+    let payer = match side {
+        Side::Bid => &user.pc_account,
+        Side::Ask => &user.coin_account,
+    };
+
     let ix = openbook_dex::instruction::new_order(
         &market.market,
         open_orders,
@@ -250,7 +274,7 @@ fn create_market_order(
         &market.event_q,
         &market.bids,
         &market.asks,
-        &user.kp.pubkey(),
+        payer,
         &user.kp.pubkey(),
         &market.coin_vault,
         &market.pc_vault,
@@ -265,11 +289,11 @@ fn create_market_order(
         user.client_order_id,
         openbook_dex::instruction::SelfTradeBehavior::DecrementTake,
         u16::MAX,
-        NonZero::new(u64::MAX).unwrap(),
+        NonZero::new(20000).unwrap(),
         i64::MAX,
     )
     .unwrap();
-    send_tx_fail_err(ctx, &[ix], &[payer, &user.kp]);
+    send_transaction_return_result(ctx, &[ix], &[&user.kp])
 }
 
 pub struct User {
@@ -291,8 +315,8 @@ pub fn create_user(
     log::debug!("creating user");
     let kp = Keypair::new();
     ctx.airdrop(&kp.pubkey(), LAMPORTS_PER_SOL * 1000).unwrap();
-    let coin_account = create_token_account(ctx, authority, mint_coin, &kp.pubkey());
-    let pc_account = create_token_account(ctx, authority, mint_pc, &kp.pubkey());
+    let coin_account = create_token_account(ctx, &kp, mint_coin, &kp.pubkey());
+    let pc_account = create_token_account(ctx, &kp, mint_pc, &kp.pubkey());
     mint_tokens(
         ctx,
         authority,
@@ -318,8 +342,8 @@ pub fn create_user(
             None,
         )
         .unwrap();
-        hash_map.insert(market.market, open_orders);
         send_tx_fail_err(ctx, &[oo_ix], &[&kp]);
+        hash_map.insert(market.market, open_orders);
     }
     User {
         kp,
@@ -393,9 +417,32 @@ fn main() {
 
     let price = 1_000_000;
     let mut rng = ThreadRng::default();
+    let mut orders_sent = 0;
     loop {
         let amount = rng.random_range(1000..10000);
-        let price_diff = rng.random_range(-1000..1000);
+        let price_diff: i64 = rng.random_range(-1000..1000);
         let new_price = price + price_diff;
+
+        let user_index = rng.random_range(0..users.len());
+        let user = &mut users[user_index];
+        let is_bid = rng.random_bool(0.5);
+        let side = if is_bid { Side::Bid } else { Side::Ask };
+
+        if let Err(e) = send_market_order(
+            &mut litesvm,
+            &openbook_id,
+            &market,
+            user,
+            side,
+            new_price as u64,
+            amount,
+        ) {
+            log::error!(
+                "Failed to send order: {:?} {orders_sent:?} orders were sent",
+                e
+            );
+            break;
+        }
+        orders_sent += 1;
     }
 }
