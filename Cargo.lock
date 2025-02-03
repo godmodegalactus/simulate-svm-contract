@@ -2654,6 +2654,7 @@ dependencies = [
  "log",
  "openbook_dex",
  "rand 0.9.0",
+ "safe-transmute",
  "solana-program",
  "solana-program-runtime",
  "solana-sdk",

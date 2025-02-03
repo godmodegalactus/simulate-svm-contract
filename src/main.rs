@@ -1,15 +1,27 @@
-use core::{hash, panic};
-use std::{collections::HashMap, num::NonZero, path::PathBuf, str::FromStr};
+use core::panic;
+use std::{collections::HashMap, num::NonZero, path::PathBuf, str::FromStr, time::Instant};
 
 use litesvm::{types::TransactionResult, LiteSVM};
 use openbook_dex::{
+    instruction::MarketInstruction,
     matching::Side,
-    state::{MarketState, OpenOrders},
+    state::{Event, EventQueueHeader, MarketState, QueueHeader},
 };
 use rand::{rngs::ThreadRng, Rng};
+use safe_transmute::{
+    transmute_many, transmute_many_pedantic, transmute_one_pedantic, transmute_to_bytes,
+    SingleManyGuard,
+};
 use solana_sdk::{
-    clock::Clock, instruction::Instruction, native_token::LAMPORTS_PER_SOL, program_pack::Pack,
-    pubkey::Pubkey, rent::Rent, signature::Keypair, signer::Signer, transaction::Transaction,
+    clock::Clock,
+    instruction::{AccountMeta, Instruction},
+    native_token::LAMPORTS_PER_SOL,
+    program_pack::Pack,
+    pubkey::Pubkey,
+    rent::Rent,
+    signature::Keypair,
+    signer::Signer,
+    transaction::Transaction,
 };
 
 pub fn find_file(filename: &str) -> Option<PathBuf> {
@@ -369,6 +381,90 @@ pub fn create_users(
         .collect()
 }
 
+fn remove_dex_account_padding<'a>(data: &[u8]) -> anyhow::Result<Vec<u64>> {
+    use openbook_dex::state::{ACCOUNT_HEAD_PADDING, ACCOUNT_TAIL_PADDING};
+    let head = &data[..ACCOUNT_HEAD_PADDING.len()];
+    if data.len() < ACCOUNT_HEAD_PADDING.len() + ACCOUNT_TAIL_PADDING.len() {
+        anyhow::bail!(
+            "dex account length {} is too small to contain valid padding",
+            data.len()
+        );
+    }
+    if head != ACCOUNT_HEAD_PADDING {
+        anyhow::bail!("dex account head padding mismatch");
+    }
+    let tail = &data[data.len() - ACCOUNT_TAIL_PADDING.len()..];
+    if tail != ACCOUNT_TAIL_PADDING {
+        anyhow::bail!("dex account tail padding mismatch");
+    }
+    let inner_data_range = ACCOUNT_HEAD_PADDING.len()..(data.len() - ACCOUNT_TAIL_PADDING.len());
+    let inner: &[u8] = &data[inner_data_range];
+    let words = match transmute_many_pedantic::<u64>(inner) {
+        Ok(word_slice) => word_slice.to_vec(),
+        Err(transmute_error) => {
+            let word_vec = transmute_error.copy().map_err(|e| e.without_src())?;
+            word_vec
+        }
+    };
+    Ok(words)
+}
+
+fn parse_event_queue(data_words: &[u64]) -> anyhow::Result<(EventQueueHeader, &[Event], &[Event])> {
+    let (header_words, event_words) = data_words.split_at(size_of::<EventQueueHeader>() >> 3);
+    let header: EventQueueHeader =
+        transmute_one_pedantic(transmute_to_bytes(header_words)).map_err(|e| e.without_src())?;
+    let events: &[Event] = transmute_many::<_, SingleManyGuard>(transmute_to_bytes(event_words))
+        .map_err(|e| e.without_src())?;
+    let (tail_seg, head_seg) = events.split_at(header.head() as usize);
+    let head_len = head_seg.len().min(header.count() as usize);
+    let tail_len = header.count() as usize - head_len;
+    Ok((header, &head_seg[..head_len], &tail_seg[..tail_len]))
+}
+
+pub fn consume_events_instruction(
+    ctx: &mut LiteSVM,
+    program_id: &Pubkey,
+    market: &Market,
+) -> anyhow::Result<Option<Instruction>> {
+    let event_q_data = ctx.get_account(&market.event_q).unwrap().data;
+    let inner = remove_dex_account_padding(&event_q_data)?;
+    let (_header, seg0, seg1) = parse_event_queue(&inner)?;
+
+    if seg0.len() + seg1.len() == 0 {
+        log::debug!("Total event queue length: 0, returning early");
+        return Ok(None);
+    } else {
+        log::debug!("Total event queue length: {}", seg0.len() + seg1.len());
+    }
+    let accounts = seg0.iter().chain(seg1.iter()).map(|event| event.owner);
+    let mut orders_accounts: Vec<_> = accounts.collect();
+    orders_accounts.sort_unstable();
+    orders_accounts.dedup();
+    // todo: Shuffle the accounts before truncating, to avoid favoring low sort order accounts
+    orders_accounts.truncate(32);
+    log::debug!("Number of unique order accounts: {}", orders_accounts.len());
+
+    let mut account_metas = Vec::with_capacity(orders_accounts.len() + 4);
+    for pubkey_words in orders_accounts {
+        let pubkey = Pubkey::try_from(transmute_to_bytes(&pubkey_words)).unwrap();
+        account_metas.push(AccountMeta::new(pubkey, false));
+    }
+    for pubkey in [&market.market, &market.event_q].iter() {
+        account_metas.push(AccountMeta::new(**pubkey, false));
+    }
+
+    let instruction_data: Vec<u8> =
+        MarketInstruction::ConsumeEvents(account_metas.len() as u16).pack();
+
+    let instruction = Instruction {
+        program_id: *program_id,
+        accounts: account_metas,
+        data: instruction_data,
+    };
+
+    Ok(Some(instruction))
+}
+
 fn setup_test_chain(openbook_id: Pubkey) -> anyhow::Result<LiteSVM> {
     let mut program_test = LiteSVM::new();
     program_test.set_sysvar(&Clock::default());
@@ -417,8 +513,14 @@ fn main() {
 
     let price = 1_000_000;
     let mut rng = ThreadRng::default();
-    let mut orders_sent = 0;
-    loop {
+    let mut cu_used: u64 = 0;
+    let mut successful_transaction: u64 = 0;
+    let mut unsuccessful_transaction: u64 = 0;
+    let mut cu_used_max: u64 = 0;
+    let nb_transactions = 100_000_000;
+    let mut number_of_consume_events = 0;
+    let instant = Instant::now();
+    for i in 0..nb_transactions {
         let amount = rng.random_range(1000..10000);
         let price_diff: i64 = rng.random_range(-1000..1000);
         let new_price = price + price_diff;
@@ -428,7 +530,7 @@ fn main() {
         let is_bid = rng.random_bool(0.5);
         let side = if is_bid { Side::Bid } else { Side::Ask };
 
-        if let Err(e) = send_market_order(
+        match send_market_order(
             &mut litesvm,
             &openbook_id,
             &market,
@@ -437,12 +539,65 @@ fn main() {
             new_price as u64,
             amount,
         ) {
-            log::error!(
-                "Failed to send order: {:?} {orders_sent:?} orders were sent",
-                e
-            );
-            break;
+            Ok(data) => {
+                user.client_order_id += 1;
+                cu_used += data.compute_units_consumed;
+                successful_transaction += 1;
+                cu_used_max = cu_used_max.max(data.compute_units_consumed);
+            }
+            Err(e) => {
+                unsuccessful_transaction += 1;
+                log::error!("Failed to send order: {:?}", e);
+            }
         }
-        orders_sent += 1;
+        if i % 1000 == 0 {
+            while let Some(instruction) =
+                consume_events_instruction(&mut litesvm, &openbook_id, &market).unwrap()
+            {
+                match send_transaction_return_result(&mut litesvm, &[instruction], &[&payer]) {
+                    Ok(data) => {
+                        cu_used += data.compute_units_consumed;
+                        successful_transaction += 1;
+                        number_of_consume_events += 1;
+                    }
+                    Err(e) => {
+                        unsuccessful_transaction += 1;
+                        log::error!("Failed to consume event: {:?}", e);
+                        break;
+                    }
+                }
+            }
+
+            for user in &users {
+                let settle_orders = openbook_dex::instruction::settle_funds(
+                    &openbook_id,
+                    &market.market,
+                    &spl_token::ID,
+                    user.open_orders.get(&market.market).unwrap(),
+                    &user.kp.pubkey(),
+                    &market.coin_vault,
+                    &user.coin_account,
+                    &market.pc_vault,
+                    &user.pc_account,
+                    None,
+                    &market.vault_signer,
+                )
+                .unwrap();
+                send_tx_fail_err(&mut litesvm, &[settle_orders], &[&user.kp]);
+            }
+        }
     }
+
+    println!("cu_used: {:?} average", cu_used / successful_transaction);
+    println!("successful_transaction: {:?}", successful_transaction);
+    println!("unsuccessful_transaction: {:?}", unsuccessful_transaction);
+    let total_transaction = successful_transaction + unsuccessful_transaction;
+    println!("total_transaction: {:?}", total_transaction);
+    println!("time: {:?}", instant.elapsed().as_secs());
+    println!(
+        "tps : {:?}",
+        total_transaction as f64 / instant.elapsed().as_secs_f64()
+    );
+    println!("number_of_consume_events: {:?}", number_of_consume_events);
+    println!("cu_used_max: {:?}", cu_used_max);
 }
