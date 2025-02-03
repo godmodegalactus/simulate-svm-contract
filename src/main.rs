@@ -1,9 +1,12 @@
 use core::panic;
-use std::path::PathBuf;
+use std::{path::PathBuf, str::FromStr};
 
 use litesvm::LiteSVM;
 use openbook_dex::state::MarketState;
-use solana_sdk::{clock::Clock, instruction::Instruction, native_token::LAMPORTS_PER_SOL, program_pack::Pack, pubkey::Pubkey, rent::Rent, signature::Keypair, signer::Signer, transaction::Transaction};
+use solana_sdk::{
+    clock::Clock, instruction::Instruction, native_token::LAMPORTS_PER_SOL, program_pack::Pack,
+    pubkey::Pubkey, rent::Rent, signature::Keypair, signer::Signer, transaction::Transaction,
+};
 
 pub fn find_file(filename: &str) -> Option<PathBuf> {
     for dir in default_shared_object_dirs() {
@@ -31,36 +34,61 @@ fn default_shared_object_dirs() -> Vec<PathBuf> {
 }
 
 fn send_tx_fail_err(ctx: &mut LiteSVM, ixs: &[Instruction], signers: &[&Keypair]) {
-    let mut transaction = Transaction::new_with_payer(ixs, None);
+    let mut transaction = Transaction::new_with_payer(ixs, Some(&signers[0].pubkey()));
     transaction.sign(signers, ctx.latest_blockhash());
     if let Err(e) = ctx.send_transaction(transaction) {
-        log::error!("Failed to send transaction: {:?} instructions : [{:?}]", e, ixs);
+        log::error!(
+            "Failed to send transaction: {:?} instructions : [{:?}]",
+            e,
+            ixs
+        );
         panic!("Failed to send transaction");
     }
 }
 
-pub fn create_program_account(ctx: &mut LiteSVM, payer: &Keypair, size: usize, owner: &Pubkey) -> Pubkey {
-    log::info!("creating account");
+pub fn create_program_account(
+    ctx: &mut LiteSVM,
+    payer: &Keypair,
+    size: usize,
+    owner: &Pubkey,
+) -> Pubkey {
+    log::debug!("creating account");
     let rent = Rent::default();
     let account = Keypair::new();
-    let lamport = rent.minimum_balance(size) * 2;
-    let ix = solana_sdk::system_instruction::create_account(&payer.pubkey(), &account.pubkey(), lamport, size as u64, owner);
+    let lamport = rent.minimum_balance(size);
+
+    let ix = solana_sdk::system_instruction::create_account(
+        &payer.pubkey(),
+        &account.pubkey(),
+        lamport,
+        size as u64,
+        owner,
+    );
     send_tx_fail_err(ctx, &[ix], &[payer, &account]);
     account.pubkey()
 }
 
 pub fn create_mint(ctx: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
-    log::info!("creating mint");
+    log::debug!("creating mint");
     let mint = create_program_account(ctx, payer, spl_token::state::Mint::LEN, &spl_token::ID);
-    let ix = spl_token::instruction::initialize_mint(&spl_token::ID, &mint, authority, None, 6).unwrap();
+    let ix =
+        spl_token::instruction::initialize_mint(&spl_token::ID, &mint, authority, None, 6).unwrap();
     send_tx_fail_err(ctx, &[ix], &[payer]);
     mint
 }
 
-pub fn create_token_account(ctx: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, owner: &Pubkey) -> Pubkey {
-    log::info!("creating token account");
-    let token_account = create_program_account(ctx, payer, spl_token::state::Account::LEN, &spl_token::ID);
-    let ix = spl_token::instruction::initialize_account(&spl_token::ID, &token_account, mint, owner).unwrap();
+pub fn create_token_account(
+    ctx: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    owner: &Pubkey,
+) -> Pubkey {
+    log::debug!("creating token account");
+    let token_account =
+        create_program_account(ctx, payer, spl_token::state::Account::LEN, &spl_token::ID);
+    let ix =
+        spl_token::instruction::initialize_account(&spl_token::ID, &token_account, mint, owner)
+            .unwrap();
     send_tx_fail_err(ctx, &[ix], &[payer]);
     token_account
 }
@@ -77,19 +105,29 @@ pub struct Market {
     pub vault_signer: Pubkey,
 }
 
-pub fn create_market(ctx: &mut LiteSVM, payer: &Keypair, openbook_id: &Pubkey, mint_coin: &Pubkey, mint_pc: &Pubkey) -> Market{
+pub fn create_market(
+    ctx: &mut LiteSVM,
+    payer: &Keypair,
+    openbook_id: &Pubkey,
+    mint_coin: &Pubkey,
+    mint_pc: &Pubkey,
+) -> Market {
     log::info!("creating market");
-    let market = create_program_account( ctx, payer, std::mem::size_of::<MarketState>(), openbook_id);
-    let bids_pk = create_program_account( ctx, payer, 1 << 16, openbook_id);
-    let asks_pk = create_program_account( ctx, payer, 1 << 16, openbook_id);
-    let req_q_pk = create_program_account( ctx, payer, 640, openbook_id);
-    let event_q_pk = create_program_account( ctx, payer, 65536, openbook_id);
+    let market = create_program_account(
+        ctx,
+        payer,
+        std::mem::size_of::<MarketState>() + 12,
+        openbook_id,
+    );
+    let bids_pk = create_program_account(ctx, payer, 65536 + 12, openbook_id);
+    let asks_pk = create_program_account(ctx, payer, 65536 + 12, openbook_id);
+    let req_q_pk = create_program_account(ctx, payer, 5120 + 12, openbook_id);
+    let event_q_pk = create_program_account(ctx, payer, 262144 + 12, openbook_id);
 
-    
     let mut i = 0;
     let (vault_signer_nonce, vault_signer_pk) = loop {
-        assert!(i < 255);
-        if let Ok(pk) = openbook_dex::state::gen_vault_signer_key(i, &market, &spl_token::ID) {
+        assert!(i < 100);
+        if let Ok(pk) = openbook_dex::state::gen_vault_signer_key(i, &market, openbook_id) {
             break (i, pk);
         }
         i += 1;
@@ -97,7 +135,65 @@ pub fn create_market(ctx: &mut LiteSVM, payer: &Keypair, openbook_id: &Pubkey, m
     let coin_vault_pk = create_token_account(ctx, payer, mint_coin, &vault_signer_pk);
     let pc_vault_pk = create_token_account(ctx, payer, mint_pc, &vault_signer_pk);
 
-    let ix = openbook_dex::instruction::initialize_market(&market, openbook_id, &mint_coin, &mint_pc, &coin_vault_pk, &pc_vault_pk, None, None, None, &bids_pk, &asks_pk, &req_q_pk, &event_q_pk, 100_000, 100, vault_signer_nonce, 500).unwrap();
+    log::debug!("market : {market:?}");
+    log::debug!("bids : {bids_pk:?}");
+    log::debug!("asks : {asks_pk:?}");
+    log::debug!("req_q : {req_q_pk:?}");
+    log::debug!("event_q : {event_q_pk:?}");
+    log::debug!("coin_vault : {coin_vault_pk:?}");
+    log::debug!("pc_vault : {pc_vault_pk:?}");
+    log::debug!("vault_signer : {vault_signer_pk:?}");
+    log::debug!("vault_signer_nonce : {vault_signer_nonce:?}");
+    log::debug!("mint_coin : {mint_coin:?}");
+    log::debug!("mint_pc : {mint_pc:?}");
+    log::debug!("openbook_id : {openbook_id:?}");
+
+    log::debug!(
+        "len : {} : {}",
+        ctx.get_account(&market).unwrap().data.len(),
+        ctx.get_account(&market).unwrap().data.len() % 8
+    );
+    log::debug!(
+        "len : {} : {}",
+        ctx.get_account(&bids_pk).unwrap().data.len(),
+        ctx.get_account(&bids_pk).unwrap().data.len() % 8
+    );
+    log::debug!(
+        "len : {} : {}",
+        ctx.get_account(&asks_pk).unwrap().data.len(),
+        ctx.get_account(&asks_pk).unwrap().data.len() % 8
+    );
+    log::debug!(
+        "len : {} : {}",
+        ctx.get_account(&req_q_pk).unwrap().data.len(),
+        ctx.get_account(&req_q_pk).unwrap().data.len() % 8
+    );
+    log::debug!(
+        "len : {} : {}",
+        ctx.get_account(&event_q_pk).unwrap().data.len(),
+        ctx.get_account(&event_q_pk).unwrap().data.len() % 8
+    );
+
+    let ix = openbook_dex::instruction::initialize_market(
+        &market,
+        openbook_id,
+        mint_coin,
+        mint_pc,
+        &coin_vault_pk,
+        &pc_vault_pk,
+        None,
+        None,
+        None,
+        &bids_pk,
+        &asks_pk,
+        &req_q_pk,
+        &event_q_pk,
+        100_000,
+        100,
+        vault_signer_nonce,
+        500,
+    )
+    .unwrap();
     send_tx_fail_err(ctx, &[ix], &[payer]);
     Market {
         market,
@@ -121,25 +217,32 @@ fn setup_test_chain(openbook_id: Pubkey) -> anyhow::Result<LiteSVM> {
     program_test.set_sysvar(&Rent::default());
 
     // deploy obk program
-    let obk_path = find_file(format!("openbook.so").as_str()).unwrap();
+    let obk_path = find_file("openbook.so").unwrap();
     program_test.add_program_from_file(openbook_id, obk_path)?;
 
     //deploy token program
-    let token_path = find_file(format!("token.so").as_str()).unwrap();
+    let token_path = find_file("token.so").unwrap();
     program_test.add_program_from_file(spl_token::ID, token_path)?;
 
     Ok(program_test)
 }
 
 fn main() {
-    let openbook_id = Pubkey::new_unique();
+    tracing_subscriber::fmt::init();
+    let openbook_id = Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").unwrap();
 
-    let mut  litesvm = setup_test_chain(openbook_id).unwrap();
+    let mut litesvm = setup_test_chain(openbook_id).unwrap();
+
+    litesvm.warp_to_slot(1);
 
     let payer = Keypair::new();
-    litesvm.airdrop(&payer.pubkey(), LAMPORTS_PER_SOL * 1000).unwrap();
+    litesvm
+        .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL * 1000)
+        .unwrap();
     let coin_mint = create_mint(&mut litesvm, &payer, &payer.pubkey());
     let pc_mint = create_mint(&mut litesvm, &payer, &payer.pubkey());
+
+    litesvm.warp_to_slot(5);
     let market = create_market(&mut litesvm, &payer, &openbook_id, &coin_mint, &pc_mint);
 
     println!("market sucessfully created: {:?}", market);
