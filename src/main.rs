@@ -1,5 +1,11 @@
 use core::panic;
-use std::{collections::HashMap, num::NonZero, path::PathBuf, str::FromStr, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZero,
+    path::PathBuf,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use litesvm::{types::TransactionResult, LiteSVM};
 use openbook_dex::{
@@ -7,7 +13,7 @@ use openbook_dex::{
     matching::Side,
     state::{Event, EventQueueHeader, MarketState, QueueHeader},
 };
-use rand::{rngs::ThreadRng, Rng};
+use rand::{rngs::ThreadRng, seq::SliceRandom, Rng};
 use safe_transmute::{
     transmute_many, transmute_many_pedantic, transmute_one_pedantic, transmute_to_bytes,
     SingleManyGuard,
@@ -308,6 +314,7 @@ fn send_market_order(
     send_transaction_return_result(ctx, &[ix], &[&user.kp])
 }
 
+#[derive(Debug)]
 pub struct User {
     pub kp: Keypair,
     pub coin_account: Pubkey,
@@ -423,8 +430,12 @@ fn parse_event_queue(data_words: &[u64]) -> anyhow::Result<(EventQueueHeader, &[
 
 pub fn consume_events_instruction(
     ctx: &mut LiteSVM,
+    rng: &mut ThreadRng,
     program_id: &Pubkey,
     market: &Market,
+    coin_wallet: &Pubkey,
+    pc_wallet: &Pubkey,
+    limit: u16,
 ) -> anyhow::Result<Option<Instruction>> {
     let event_q_data = ctx.get_account(&market.event_q).unwrap().data;
     let inner = remove_dex_account_padding(&event_q_data)?;
@@ -437,11 +448,15 @@ pub fn consume_events_instruction(
         log::debug!("Total event queue length: {}", seg0.len() + seg1.len());
     }
     let accounts = seg0.iter().chain(seg1.iter()).map(|event| event.owner);
-    let mut orders_accounts: Vec<_> = accounts.collect();
-    orders_accounts.sort_unstable();
-    orders_accounts.dedup();
-    // todo: Shuffle the accounts before truncating, to avoid favoring low sort order accounts
-    orders_accounts.truncate(32);
+    let mut accounts_to_process = HashSet::new();
+    for account in accounts {
+        accounts_to_process.insert(account);
+        if accounts_to_process.len() >= 32 {
+            break;
+        }
+    }
+    let mut orders_accounts = accounts_to_process.iter().cloned().collect::<Vec<_>>();
+    orders_accounts.shuffle(rng);
     log::debug!("Number of unique order accounts: {}", orders_accounts.len());
 
     let mut account_metas = Vec::with_capacity(orders_accounts.len() + 4);
@@ -449,12 +464,11 @@ pub fn consume_events_instruction(
         let pubkey = Pubkey::try_from(transmute_to_bytes(&pubkey_words)).unwrap();
         account_metas.push(AccountMeta::new(pubkey, false));
     }
-    for pubkey in [&market.market, &market.event_q].iter() {
+    for pubkey in [&market.market, &market.event_q, coin_wallet, pc_wallet].iter() {
         account_metas.push(AccountMeta::new(**pubkey, false));
     }
 
-    let instruction_data: Vec<u8> =
-        MarketInstruction::ConsumeEvents(account_metas.len() as u16).pack();
+    let instruction_data: Vec<u8> = MarketInstruction::ConsumeEvents(limit).pack();
 
     let instruction = Instruction {
         program_id: *program_id,
@@ -464,6 +478,38 @@ pub fn consume_events_instruction(
 
     Ok(Some(instruction))
 }
+
+// pub fn consume_events(
+//     ctx: &mut LiteSVM,
+//     program_id: &Pubkey,
+//     market: &Market,
+//     users: &[User],
+//     payer: &Keypair,
+//     coin_wallet: &Pubkey,
+//     pc_wallet: &Pubkey,
+// ) {
+//     for users in users.chunks(20) {
+//         let open_orders_accounts = users
+//             .iter()
+//             .flat_map(|user| user.open_orders.get(&market.market))
+//             .collect::<Vec<_>>();
+
+//         let instruction: Instruction = openbook_dex::instruction::consume_events(program_id, open_orders_accounts, &market.market, &market.event_q, coin_wallet, pc_wallet, 100).unwrap();
+
+//         match send_transaction_return_result(ctx, &[instruction], &[&payer]) {
+//             Ok(data) => {
+//                 log::info!("Consume event success");
+//                 for log in data.logs {
+//                     log::info!("{:?}", log);
+//                 }
+//             }
+//             Err(e) => {
+//                 log::error!("Failed to consume event: {:?}", e);
+//                 break;
+//             }
+//         }
+//     }
+// }
 
 fn setup_test_chain(openbook_id: Pubkey) -> anyhow::Result<LiteSVM> {
     let mut program_test = LiteSVM::new();
@@ -482,6 +528,7 @@ fn setup_test_chain(openbook_id: Pubkey) -> anyhow::Result<LiteSVM> {
 }
 
 fn main() {
+    let mut slot = 1024;
     tracing_subscriber::fmt::init();
     let openbook_id = Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").unwrap();
 
@@ -494,9 +541,14 @@ fn main() {
     let coin_mint = create_mint(&mut litesvm, &payer, &payer.pubkey());
     let pc_mint = create_mint(&mut litesvm, &payer, &payer.pubkey());
 
-    litesvm.warp_to_slot(1);
+    let payer_coin_wallet = create_token_account(&mut litesvm, &payer, &coin_mint, &payer.pubkey());
+    let payer_pc_wallet = create_token_account(&mut litesvm, &payer, &pc_mint, &payer.pubkey());
+
+    litesvm.warp_to_slot(slot);
+    slot += 1;
     let market = create_market(&mut litesvm, &payer, &openbook_id, &coin_mint, &pc_mint);
-    litesvm.warp_to_slot(2);
+    litesvm.warp_to_slot(slot);
+    slot += 1;
     println!("market sucessfully created: {:?}", market);
 
     let mut users = create_users(
@@ -508,7 +560,8 @@ fn main() {
         &pc_mint,
         100,
     );
-    litesvm.warp_to_slot(3);
+    litesvm.warp_to_slot(slot);
+    slot += 1;
     println!("users sucessfully created: {:?}", users.len());
 
     let price = 1_000_000;
@@ -517,10 +570,46 @@ fn main() {
     let mut successful_transaction: u64 = 0;
     let mut unsuccessful_transaction: u64 = 0;
     let mut cu_used_max: u64 = 0;
-    let nb_transactions = 100_000_000;
+    let nb_transactions = 10_000_000;
     let mut number_of_consume_events = 0;
+    let mut number_of_user_settle = 0;
     let instant = Instant::now();
+    let mut metric_instant = Instant::now();
+    let mut just_transaction_instant = Instant::now();
+    let mut just_transaction_duration = Duration::from_nanos(0);
+
+    let mut last_successful_transaction = 0;
+    let mut last_unsuccessful_transaction = 0;
+    let mut last_number_of_consume_events = 0;
+    let mut last_number_of_user_settle = 0;
+
     for i in 0..nb_transactions {
+        if metric_instant.elapsed().as_millis() > 1000 {
+            let total_transaction = successful_transaction
+                + unsuccessful_transaction
+                + number_of_consume_events
+                + number_of_user_settle;
+            let transaction_diff = total_transaction
+                - last_successful_transaction
+                - last_unsuccessful_transaction
+                - last_number_of_consume_events
+                - last_number_of_user_settle;
+            println!("successful_transaction: {:?}", successful_transaction);
+            println!("unsuccessful_transaction: {:?}", unsuccessful_transaction);
+            println!(
+                "tps (all) : {:?}",
+                (transaction_diff as f64) / metric_instant.elapsed().as_secs_f64()
+            );
+            println!(
+                "tps (tranasctions) : {:?} \n",
+                successful_transaction as f64 / just_transaction_duration.as_secs_f64()
+            );
+            last_successful_transaction = successful_transaction;
+            last_unsuccessful_transaction = unsuccessful_transaction;
+            last_number_of_consume_events = number_of_consume_events;
+            last_number_of_user_settle = number_of_user_settle;
+            metric_instant = Instant::now();
+        }
         let amount = rng.random_range(1000..10000);
         let price_diff: i64 = rng.random_range(-1000..1000);
         let new_price = price + price_diff;
@@ -551,17 +640,25 @@ fn main() {
             }
         }
         if i % 1000 == 0 {
-            while let Some(instruction) =
-                consume_events_instruction(&mut litesvm, &openbook_id, &market).unwrap()
+            just_transaction_duration += just_transaction_instant.elapsed();
+            litesvm.warp_to_slot(slot);
+            slot += 1;
+            while let Some(instruction) = consume_events_instruction(
+                &mut litesvm,
+                &mut rng,
+                &openbook_id,
+                &market,
+                &payer_coin_wallet,
+                &payer_pc_wallet,
+                255,
+            )
+            .unwrap()
             {
                 match send_transaction_return_result(&mut litesvm, &[instruction], &[&payer]) {
-                    Ok(data) => {
-                        cu_used += data.compute_units_consumed;
-                        successful_transaction += 1;
+                    Ok(_) => {
                         number_of_consume_events += 1;
                     }
                     Err(e) => {
-                        unsuccessful_transaction += 1;
                         log::error!("Failed to consume event: {:?}", e);
                         break;
                     }
@@ -583,8 +680,18 @@ fn main() {
                     &market.vault_signer,
                 )
                 .unwrap();
-                send_tx_fail_err(&mut litesvm, &[settle_orders], &[&user.kp]);
+
+                match send_transaction_return_result(&mut litesvm, &[settle_orders], &[&user.kp]) {
+                    Ok(_) => {
+                        number_of_user_settle += 1;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to settle user: {:?}", e);
+                        panic!("Failed to settle user");
+                    }
+                }
             }
+            just_transaction_instant = Instant::now();
         }
     }
 
@@ -599,5 +706,6 @@ fn main() {
         total_transaction as f64 / instant.elapsed().as_secs_f64()
     );
     println!("number_of_consume_events: {:?}", number_of_consume_events);
+    println!("number_of_user_settle: {:?}", number_of_user_settle);
     println!("cu_used_max: {:?}", cu_used_max);
 }
