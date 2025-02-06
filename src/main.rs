@@ -533,6 +533,7 @@ fn main() {
     let openbook_id = Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").unwrap();
 
     let mut litesvm = setup_test_chain(openbook_id).unwrap();
+    litesvm = litesvm.with_sigverify(false);
 
     let payer = Keypair::new();
     litesvm
